@@ -2,10 +2,12 @@
 #include <unistd.h>
 #include <sys/ptrace.h>
 #include <sys/wait.h>
+#include <sys/personality.h>
 #include <string>
 #include <linenoise.h>
 #include <vector>
 #include <sstream>
+#include <unordered_map>
 
 std::vector<std::string> split(const std::string &s, char delimeter) {
     std::vector<std::string> out{};
@@ -25,19 +27,67 @@ bool is_prefix(const std::string& s, const std::string& of) {
     return std::equal(s.begin(), s.end(), of.begin());
 }
 
+class breakpoint {
+    public:
+        breakpoint(pid_t pid, std::intptr_t addr)
+            : m_pid{pid}, m_addr{addr}, m_enabled{false}, m_saved_data{}
+        {}
+        void enable();
+        void disable();
+        auto is_enabled() const -> bool { return m_enabled; }
+        auto get_address() const -> std::intptr_t { return m_addr; }
+
+    private:
+        pid_t m_pid;
+        std::intptr_t m_addr;
+        bool m_enabled;
+        uint8_t m_saved_data; //data which used to be at the breakpoint address
+};
+
+void breakpoint::enable() {
+    /*
+    Replace the instruction at a given address with an int3 instruction.
+    Save out what used to be at the address so we can restore the code later.
+    */
+    auto data = ptrace(PTRACE_PEEKDATA, m_pid, m_addr, nullptr);
+    m_saved_data = static_cast<uint8_t>(data & 0xff); // set bits at positions > 8 bits to 0
+    uint64_t int3 = 0xcc; // instruction to set code at a breakpoint
+    uint64_t data_with_int3 = ((data & ~0xff) | int3);
+    ptrace(PTRACE_POKEDATA, m_pid, m_addr, data_with_int3);
+
+    m_enabled = true;
+}
+
+void breakpoint::disable() {
+    auto data = ptrace(PTRACE_PEEKDATA, m_pid, m_addr, nullptr);
+    auto restored_data = ((data & ~0xff) | m_saved_data);
+    ptrace(PTRACE_POKEDATA, m_pid, m_addr, restored_data);
+    
+    m_enabled = false;
+}
+
 class debugger {
     public:
         debugger(std::string prog_name, pid_t pid) : m_prog_name{std::move(prog_name)}, m_pid{pid} {
 
         }
-
+        
         void run();
+        void set_breakpoint_at_address(std::intptr_t addr);
     private:
         std::string m_prog_name;
+        std::unordered_map<std::intptr_t, breakpoint> m_breakpoints;
         pid_t m_pid;
         void handle_command(const std::string& line);
         void continue_execution();
 };
+
+void debugger::set_breakpoint_at_address(std::intptr_t addr) {
+    std::cout << "Set breakpoint at address 0x" << std::hex << addr << std::endl;
+    breakpoint bp {m_pid, addr};
+    bp.enable();
+    m_breakpoints.insert({addr, bp});
+}
 
 void debugger::run() {
     /*
@@ -64,6 +114,10 @@ void debugger::handle_command(const std::string& line) {
     if (is_prefix(command, "continue")) {
         continue_execution();
     }
+    else if (is_prefix(command, "break")) {
+        std::string addr {args[1], 2}; // Assume 0xADDRESS
+        set_breakpoint_at_address(std::stol(addr, 0, 16));
+    }
     else {
         std::cerr << "Unknown command \n";
     }
@@ -75,6 +129,14 @@ void debugger::continue_execution() {
     int wait_status;
     auto options = 0;
     waitpid(m_pid, &wait_status, options);
+}
+
+void execute_debugee (const std::string& prog_name) {
+    if (ptrace(PTRACE_TRACEME, 0, 0, 0) < 0) {
+        std::cerr << "Error in ptrace";
+        return;
+    }
+    execl(prog_name.c_str(), prog_name.c_str(), nullptr);
 }
 
 int main(int argc, char* argv[]) {
@@ -89,8 +151,8 @@ int main(int argc, char* argv[]) {
     if (pid == 0) {
         // child process
         // execute debugee
-        ptrace(PTRACE_TRACEME, 0, nullptr, nullptr);
-        execl(prog, prog, nullptr);
+        personality(ADDR_NO_RANDOMIZE);
+        execute_debugee(prog);
     }
     else if (pid >= 1) {
         // parent process
